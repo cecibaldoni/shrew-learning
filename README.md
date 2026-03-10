@@ -2,7 +2,7 @@
 
 This project investigates spatial learning and navigation in common shrews (*Sorex araneus*) across seasons and captivity conditions. Three behavioural tasks were used: a **spatial learning maze**, a **visual associative learning** task, and a **path integration** task.
 
-In the spatial learning task, shrews navigated a multiple T-maze (50×50 cm, 13 decision points) to locate a food reward, performing ten consecutive trials. In the visual associative learning and path integration tasks, shrews moved freely in a square sand arena (114×114 cm, 100 wells) to locate a food item marked with a visual cue. Straightness of the path towards the food (*straightness_to_food*) indexes visual associative learning; straightness of the return path (*straightness_back*) indexes path integration. Animals were tested across summer, winter, and spring, and included both wild-caught and captive-born individuals, allowing comparison of seasonal and captivity effects on learning and navigation.
+In the spatial learning task, shrews navigated a multiple T-maze (50×50 cm, 13 decision points) to locate a food reward, performing ten consecutive trials. In the visual associative learning and path integration tasks, shrews moved freely in a square sand arena (114×114 cm, 100 wells) to locate a food item marked with a visual cue. Straightness of the path towards the food (*straightness_to_food*) indexes visual associative learning; straightness of the return path (*straightness_back*) indexes path integration. Animals were tested across summer, winter, and spring, and included both wild-caught and captive individuals.
 
 ## Data
 
