@@ -1,9 +1,3 @@
----
-title: "README"
-author: "Cecilia Baldoni"
-format: html
----
-
 ## Project overview
 
 This project investigates spatial learning and navigation in common shrews (*Sorex araneus*) across seasons and captivity conditions. Three behavioural tasks were used: a **spatial learning maze**, a **visual associative learning** task, and a **path integration** task.
@@ -122,8 +116,3 @@ In RStudio, open the `.qmd` file and either run each chunck of code by clicking 
 4. `visual-cue_path-integration/scripts/data_cleaning.R` — processes raw tracking data, computes trajectory metrics and speed, builds door memory dataset, saves `visual_assoc_data.rds`, `path_integration_data.rds`, `door_result.rds`
 5. `visual-cue_path-integration/scripts/models.R` — loads RDS files, fits Bayesian models, produces plots
 
-
-
-
-
-## License

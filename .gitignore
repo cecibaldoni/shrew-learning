@@ -3,7 +3,7 @@
 .RData
 .Ruserdata
 
-.csv
+*.csv
 
 .venv/          
 renv/library/   
