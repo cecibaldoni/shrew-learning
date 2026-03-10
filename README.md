@@ -6,16 +6,17 @@ In the spatial learning task, shrews navigated a multiple T-maze (50×50 cm, 13 
 
 ## Data
 
-You can find the data associated with this project at this link:
+You can find the data associated with this project at this link: https://osf.io/qa96m/overview
 The OSF repository contains two folders. Download them and place them as follows:
 
+```
 The maze data folder                         → shrew-learning/maze/data/
 The visual/path integration data folder      → shrew-learning/visual-cue_path-integration/data/
-
+```
 
 See repository structure for details.
 
-The raw data in the repository is the following
+The raw data in the repository is the following:
 
 ```
 ├── maze/
