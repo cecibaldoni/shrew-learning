@@ -3,7 +3,10 @@
 .RData
 .Ruserdata
 
+*.rds
 *.csv
+*.png
+maze/data/processed/*.txt
 
 .venv/          
 renv/library/   
