@@ -1,0 +1,824 @@
+---
+title: Tidy file names
+jupyter: python3
+---
+
+```{r setup, include=FALSE}
+library(reticulate)
+use_virtualenv(here::here(".venv"), required = TRUE)
+```
+
+This notebook processes shrew tracking data from a maze/spatial learning task. The automated tracking was extracted using [TRex](trex.run).
+
+This script extracts for each trial the correct path from average images of the maze created in TRex, compares the animal's trajectory to that path, and computes the following metrics: path efficiency, directionality, and deviation from the correct path.
+
+The two main outputs are:
+
+- `maze_results.csv`: one row per trial, with summary metrics;
+- `deviation_report.csv`: one row per deviation event, with location and length of the "wrong" path.
+
+Run the chunks in order. The deviation report section depends on the outputs of `process_data_sets` and must be run after it.
+
+```{python}
+import os
+import subprocess
+import cv2
+import numpy as np
+import pandas as pd
+from skimage.morphology import skeletonize
+from skimage import img_as_bool, img_as_ubyte
+import matplotlib.pyplot as plt
+from shapely.geometry import LineString, Point
+from sklearn.cluster import DBSCAN
+from scipy.spatial.distance import cdist
+from scipy.ndimage import label
+from matplotlib.colors import Normalize
+import matplotlib.cm as cm
+
+# Set working directory to project root
+project_root = subprocess.run(
+    ["Rscript", "-e", "cat(here::here())"],
+    capture_output=True, text=True
+).stdout.strip()
+```
+
+```{python}
+directory = os.path.join(project_root, 'maze', 'data')
+raw_directory = os.path.join(directory, 'raw')
+processed_directory = os.path.join(directory, 'processed')
+results_directory = os.path.join(directory, 'results')
+
+default_cm_per_pixel = 0.071316
+summer_cm_per_pixel = 0.155402
+plot_count = 0
+buffer_distance = 1.0
+dp_to_remove = [4, 7, 10, 11, 14, 17, 20]
+```
+
+## Define functions
+
+The functions below handle all steps of the processing pipeline: reading and applying image masks, extracting and cleaning the correct path skeleton, 
+smoothing tracking coordinates, classifying each frame as on or off path, identifying decision points, and computing deviation sequences.
+
+```{python}
+# apply mask to an image
+def apply_mask_to_image(image_path, mask):
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"Image not found at {image_path}.")
+    return cv2.bitwise_and(image, image, mask=mask)
+
+# read and process mask image
+def get_mask(mask_path):
+    print(f"Trying to read mask from: {mask_path}") 
+    mask = cv2.imread(mask_path, 0)
+    if mask is None:
+        raise ValueError(f"Mask not found at {mask_path}.")
+    _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+    return mask
+
+# replace Inf and NaN with last known location
+def replace_inf(data):
+    for column in ['x', 'y']:
+        data[column] = data[column].replace([np.inf, -np.inf], np.nan)
+        data[column] = data[column].ffill().bfill()
+    return data
+
+# smooth simple moving average
+def smooth_data(data, window_size=4):
+    data['x'] = data['x'].rolling(window=window_size, min_periods=1, center=True).mean()
+    data['y'] = data['y'].rolling(window=window_size, min_periods=1, center=True).mean()
+    return data
+
+def overlay_path(image, path_coordinates, color=(255, 0, 0), thickness=2):
+    for i in range(1, len(path_coordinates)):
+        pt1 = (int(path_coordinates[i - 1][0]), int(path_coordinates[i - 1][1]))
+        pt2 = (int(path_coordinates[i][0]), int(path_coordinates[i][1]))
+        cv2.line(image, pt1, pt2, color, thickness)
+
+def calculate_path_length(coordinates):
+    total_distance = 0
+    for i in range(1, len(coordinates)):
+        x1, y1 = coordinates[i-1]
+        x2, y2 = coordinates[i]
+        total_distance += ((x2 - x1)**2 + (y2 - y1)**2)**0.5
+    return total_distance
+
+
+def extract_path_coordinates(image, cm_per_pixel):
+    print(f"Extracting path coordinates from the image array")
+    image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    image_blurred = cv2.GaussianBlur(image_gray, (5, 5), 0)  # apply Gaussian Blur
+    _, thresh = cv2.threshold(image_blurred, 127, 255, cv2.THRESH_BINARY)  # apply threshold to isolate the path
+    thresh_bool = img_as_bool(thresh)  # convert to boolean
+    skeleton = skeletonize(thresh_bool)
+    skeleton_uint8 = img_as_ubyte(skeleton)  # convert back to uint8
+
+    coords = np.column_stack(np.nonzero(skeleton))
+
+    def find_endpoints(skeleton):
+        endpoints = []
+        for y, x in np.argwhere(skeleton):
+            if np.sum(skeleton[y-1:y+2, x-1:x+2]) == 2:  # the endpoint has only one connection
+                endpoints.append((y, x))
+        return endpoints
+
+    endpoints = find_endpoints(skeleton)
+    if len(endpoints) < 2:
+        raise ValueError(f"Expected at least 2 endpoints, found {len(endpoints)}")
+
+    def follow_path(start, skeleton):
+        y, x = start
+        path = [(y, x)]
+        visited = set(path)
+        while True:
+            neighbors = [(y + dy, x + dx) for dy in [-1, 0, 1] for dx in [-1, 0, 1] if (dy, dx) != (0, 0)]
+            next_step = None
+            for ny, nx in neighbors:
+                if skeleton[ny, nx] and (ny, nx) not in visited:
+                    next_step = (ny, nx)
+                    break
+            if next_step is None:
+                break
+            y, x = next_step
+            path.append((y, x))
+            visited.add((y, x))
+        return path
+
+    start_point = (0, 0)  
+    start_endpoint = min(endpoints, key=lambda point: np.linalg.norm(np.array(point) - np.array(start_point)))
+    path = follow_path(start_endpoint, skeleton)
+    
+    path_coords = [(x * cm_per_pixel, y * cm_per_pixel) for y, x in path]
+    print(f"Path coordinates extracted: {len(path_coords)} points")
+    return path_coords
+
+
+def clean_coordinates(coordinates, min_distance):
+    if len(coordinates) == 0:
+        return []
+
+    cleaned_coords = [coordinates[0]]
+
+    for point in coordinates[1:]:
+        last_cleaned_point = cleaned_coords[-1]
+
+        # check points are tuples or lists with two elements (x, y)
+        if len(point) != 2 or len(last_cleaned_point) != 2:
+            raise ValueError(f"Unexpected coordinate format: {point} or {last_cleaned_point} is not a valid 2D point.")
+
+        # Euclidean distance between two points
+        distance = np.sqrt((point[0] - last_cleaned_point[0])**2 + (point[1] - last_cleaned_point[1])**2)
+        
+        if np.isscalar(distance) and distance >= float(min_distance):
+            cleaned_coords.append(point)
+
+    return cleaned_coords
+
+
+def decision_points(coordinates, threshold_angle=145):
+    decision_points = []
+    for i in range(1, len(coordinates) - 1):
+        p1, p2, p3 = coordinates[i - 1], coordinates[i], coordinates[i + 1]
+        v1 = np.array(p1) - np.array(p2)
+        v2 = np.array(p3) - np.array(p2)
+        angle = np.degrees(np.arccos(np.clip(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)), -1.0, 1.0)))
+        if angle < threshold_angle:
+            decision_points.append(p2)
+    return decision_points
+
+def remove_decision_points(file_path, points_to_remove):
+    with open(file_path, 'r') as file:
+        lines = file.readlines()
+    modified_lines = [line for idx, line in enumerate(lines, start=1) if idx not in points_to_remove]
+
+    with open(file_path, 'w') as file:
+        file.writelines(modified_lines)
+
+def cluster_decision_points(decision_points, eps=2.0, min_samples=1):
+    if not decision_points:
+        return []
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(decision_points)
+    cluster_centers = []
+    for cluster_label in set(clustering.labels_):
+        cluster_points = np.array([point for point, label in zip(decision_points, clustering.labels_) if label == cluster_label])
+        center = cluster_points.mean(axis=0)
+        cluster_centers.append(center)
+    return cluster_centers
+
+def find_closest_decision_point(point, decision_points):
+    # ensure decision_points is a 2-dimensional array
+    if isinstance(decision_points, list):
+        decision_points = np.array(decision_points)
+    if len(decision_points.shape) == 1:
+        decision_points = decision_points.reshape(-1, 2)
+
+    distances = cdist([point], decision_points)
+    min_distance_index = np.argmin(distances)
+    return decision_points[min_distance_index], min_distance_index + 1  # Return both point and 1-based index
+
+def read_coordinates(file_path):
+    with open(file_path, 'r') as file:
+        return [tuple(map(float, line.strip().split(','))) for line in file]
+
+def save_coordinates_to_txt(coordinates, file_path, is_spring_2021=False):
+    # reverse the coordinates if it's spring_2021 (the maze was flipped in this season)
+    if is_spring_2021:
+        coordinates = coordinates[::-1]
+    
+    with open(file_path, 'w') as f:
+        for coord in coordinates:
+            f.write(f"{coord[0]},{coord[1]}\n")
+    print(f"Coordinates saved to {file_path}")
+
+
+def smooth_on_path(track_data, max_noisy_points=3):
+    print("Starting smooth_on_path function")
+    if 'on_path' not in track_data.columns:
+        raise ValueError("'on_path' column is missing from track_data.")
+    
+    on_path = track_data['on_path'].copy().astype(bool)
+    smoothed_on_path = on_path.copy()
+    
+    n = len(on_path)
+    i = 0
+    while i < n:
+        if not on_path.iloc[i]:
+            start = i
+            while i < n and not on_path.iloc[i]:
+                i += 1
+
+            if i - start <= max_noisy_points:
+                smoothed_on_path.iloc[start:i] = True
+        else:
+            i += 1
+
+    track_data['on_path_smoothed'] = smoothed_on_path
+    print("Finished smooth_on_path function")
+    return track_data
+
+
+def mark_path_status(tracking_data, correct_path, buffer_distance=1.0, max_noisy_points=3):
+    print("Starting mark_path_status function")
+    correct_path_line = LineString(correct_path)
+    path_buffer = correct_path_line.buffer(buffer_distance)
+    
+    deviations = []
+    on_path_count = 0
+    for index, row in tracking_data.iterrows():
+        point = Point(row['x'], row['y'])
+        is_within = point.within(path_buffer)
+        deviations.append(is_within)
+        if is_within:
+            on_path_count += 1
+
+    tracking_data['on_path'] = deviations
+    tracking_data = smooth_on_path(tracking_data, max_noisy_points=max_noisy_points)  # Smooth the 'on_path' column
+    
+    # diagnostic print statements
+    total_points = len(tracking_data)
+    print(f"Total tracking points: {total_points}, Points inside buffer: {on_path_count}")
+    print(f"Smoothed 'on_path' values: {tracking_data['on_path_smoothed'].value_counts()}")
+    
+    # are all points are correctly handled?
+    first_true_index = tracking_data['on_path_smoothed'].idxmax() if tracking_data['on_path_smoothed'].any() else None
+    if first_true_index and first_true_index > 0:
+        tracking_data.loc[:first_true_index, 'on_path_smoothed'] = True
+
+    print("Finished mark_path_status function")
+    return tracking_data
+
+def identify_deviation(track_data):
+    deviations = []
+    current_deviation = []
+    for index, row in track_data.iterrows():
+        if not row['on_path_smoothed']:
+            current_deviation.append((row['x'], row['y']))
+        else:
+            if current_deviation:
+                deviations.append(current_deviation)
+                current_deviation = []
+    if current_deviation:
+        deviations.append(current_deviation)
+    return deviations
+
+# calculate the length of a deviation
+def calculate_deviation_length(deviation):
+    return sum(np.linalg.norm(np.array(deviation[i]) - np.array(deviation[i+1])) for i in range(len(deviation)-1))
+            
+def get_dp_to_remove(key):
+    if any(pattern in key for pattern in ["summer_20210802-1", "summer_20210802-5", "summer_20210912-2"]):
+        return [4, 8, 9, 12, 15, 18]  # custom list for summer trials
+    else:
+        return [4, 7, 10, 11, 14, 17, 20]  # default list for other trials
+```
+
+The following functions handle path efficiency and directionality. Path efficiency is calculated as the proportion of frames within a buffer zone 
+around the correct path. Directionality functions project the animal's position onto the path to determine whether each step was forward or backward.
+
+```{python}
+def create_path_buffer(correct_path, buffer_width):
+    line = LineString(correct_path)
+    path_buffer = line.buffer(buffer_width / 2)  # Half the buffer width on each side
+    return path_buffer
+
+def calculate_adjusted_path_efficiency_with_buffer(correct_path, shrew_path, track_data, buffer_width=2.0):
+    # create buffer around the correct path
+    path_buffer = create_path_buffer(correct_path, buffer_width)
+
+    # use the 'on_path_smoothed' column to count the number of points inside the buffer
+    on_path_smoothed_count = track_data['on_path_smoothed'].sum()  # Count the number of 'True' values in the 'on_path_smoothed' column
+    total_points = len(track_data)  # Total number of points in the shrew's path
+
+    # path efficiency as the percentage of the shrew's smoothed path that is within the buffer
+    path_efficiency = on_path_smoothed_count / total_points
+
+    print(f"Total shrew path points: {total_points}, Smoothed points inside buffer: {on_path_smoothed_count}")
+    print(f"Path Efficiency: {path_efficiency}")
+    
+    return path_efficiency, path_buffer
+
+# functions to check directionality
+
+def calculate_cumulative_distances(path_coords):
+    distances = [0.0]
+    for i in range(1, len(path_coords)):
+        dist = np.linalg.norm(np.array(path_coords[i]) - np.array(path_coords[i-1]))
+        distances.append(distances[-1] + dist)
+    return np.array(distances)
+
+def project_points_onto_path(track_coords, path_coords, cumulative_distances):
+    line = LineString(path_coords)
+    projected_distances = []
+
+    for coord in track_coords:
+        point = Point(coord)
+        # Project point onto line (path)
+        projected_point = line.project(point)
+        projected_distances.append(projected_point)
+
+    return np.array(projected_distances)
+
+def determine_directional_movement(projected_distances, reversed_trial=False):
+    directional_movement = ['forward']  # first step assumed forward
+    for i in range(1, len(projected_distances)):
+        if reversed_trial:
+            if projected_distances[i] < projected_distances[i - 1]:
+                directional_movement.append('forward')
+            else:
+                directional_movement.append('backward')
+        else:
+            if projected_distances[i] > projected_distances[i - 1]:
+                directional_movement.append('forward')
+            else:
+                directional_movement.append('backward')
+    return directional_movement
+
+
+
+def calculate_directional_efficiency(track_data, path_buffer, directional_movement):
+    efficient_points = 0
+    total_forward_points = 0
+
+    for i, row in track_data.iterrows():
+        if directional_movement[i] == 'forward':
+            total_forward_points += 1
+            point = Point(row['x'], row['y'])
+            if path_buffer.contains(point):
+                efficient_points += 1
+
+    if total_forward_points == 0:
+        return 0.0  # Avoid division by zero
+
+    directional_efficiency = efficient_points / total_forward_points
+    return directional_efficiency
+
+def calculate_backward_metrics(track_data, directional_movement, path_buffer):
+    if len(directional_movement) != len(track_data):
+        raise ValueError(f"Mismatch in lengths: track_data={len(track_data)}, directional_movement={len(directional_movement)}")
+
+    # create masks
+    backward_mask = np.array(directional_movement) == 'backward'
+    buffer_mask = track_data.apply(lambda row: Point(row['x'], row['y']).within(path_buffer), axis=1).to_numpy()
+
+    # % of all frames that were backward
+    perc_backward = backward_mask.sum() / len(directional_movement)
+
+    # % of buffer points that were backward
+    buffer_indices = np.where(buffer_mask)[0]
+    if len(buffer_indices) > 0:
+        perc_backward_buffer = backward_mask[buffer_indices].sum() / len(buffer_indices)
+    else:
+        perc_backward_buffer = np.nan  # or 0 depending on logic
+
+
+    print(f"→ Backward inside buffer: {backward_mask[buffer_indices].sum()} / {len(buffer_indices)}")
+    print(f"→ Overall backward: {perc_backward:.2%}")
+    print(f"→ Backward inside buffer: {perc_backward_buffer:.2%}")
+
+    return perc_backward, perc_backward_buffer
+
+```
+
+## File association
+
+Files in the raw directory must follow the naming convention `[type]_[season]_[date-ID]_[trial].[ext]`, for example:
+
+- `track_spring_20240520-1_T1.csv`
+- `path_spring_20240520-1_T1.png`
+- `mask_spring_20240520-1_T1.png`
+- `average_spring_20240520-1_T1.png`
+
+`associate_files()` groups these into trial sets by key. Any trial with missing files will be flagged in the output and skipped during processing, this is because all files are needed for the processing.
+
+```{python}
+def associate_files(directory):
+    file_dict = {}
+    for filename in os.listdir(directory):
+        parts = filename.split('_')
+        if len(parts) >= 4:
+            key = '_'.join(parts[1:-1]) + '_' + parts[-1].split('.')[0]
+            if "summer_2021" in filename:
+                cm_per_pixel = summer_cm_per_pixel
+            else:
+                cm_per_pixel = default_cm_per_pixel
+                
+            if key not in file_dict:
+                file_dict[key] = {
+                    'track_csv': None,
+                    'average_png': None,
+                    'mask_png': None,
+                    'path_png': None,
+                    'cm_per_pixel': cm_per_pixel  # Store cm_per_pixel for each key
+                }
+            if filename.endswith('.csv') and 'track_' in filename:
+                file_dict[key]['track_csv'] = filename
+            elif filename.endswith('.png'):
+                if 'average' in filename:
+                    file_dict[key]['average_png'] = filename
+                elif 'mask' in filename:
+                    file_dict[key]['mask_png'] = filename
+                elif 'path' in filename:
+                    file_dict[key]['path_png'] = filename
+
+    for key, files in file_dict.items():
+        missing_files = [file_type for file_type, file_name in files.items() if file_type != 'cm_per_pixel' and file_name is None]
+        if missing_files:
+            print(f"Missing files for group {key}: {missing_files}")
+        else:
+            print(f"All files found for group {key}")
+
+    return file_dict
+```
+
+```{python}
+# check for missing files
+file_groups = associate_files(raw_directory)
+```
+
+## Process trials
+
+`process_data_sets()` iterates over all complete trial groups and for each one:
+
+1. Extracts and cleans the correct path from the masked path image
+2. Identifies and clusters decision points along the path
+3. Smooths the animal's tracking coordinates
+4. Classifies each frame as on or off path using a buffer zone
+5. Computes path efficiency, directional efficiency, and backward movement metrics
+
+Output files written to `processed/` for each trial:
+
+- `track_{key}.csv`: full tracking data with on-path classification
+- `coordinates_{key}.txt`: correct path coordinates
+- `decpoints_{key}.txt`: decision point coordinates
+
+A summary across all trials is saved as `maze_results.csv`.
+
+```{python}
+def process_data_sets(file_dict, raw_directory, processed_directory, min_distance=1.0, eps=2.0, buffer_width=2.0):
+    results = []
+
+    for key, files in file_dict.items():
+        if files['path_png'] and files['mask_png'] and files['track_csv']:
+            is_spring_2021 = key.startswith("spring_2021")
+            print(f"Processing: {key}, is_spring_2021 = {is_spring_2021}")
+
+            path_image_path = os.path.join(raw_directory, files['path_png'])
+            mask_image_path = os.path.join(raw_directory, files['mask_png'])
+            track_data_path = os.path.join(raw_directory, files['track_csv'])
+            cm_per_pixel = files['cm_per_pixel']
+
+            mask = get_mask(mask_image_path)
+            masked_path_image = apply_mask_to_image(path_image_path, mask)
+
+            path_coordinates = extract_path_coordinates(masked_path_image, cm_per_pixel)
+           # print(f"Number of coordinates before cleaning: {len(path_coordinates)}")
+
+            cleaned_path_coordinates = clean_coordinates(path_coordinates, min_distance)
+           # print(f"Number of coordinates after cleaning: {len(cleaned_path_coordinates)}")
+
+            decision_path_coordinates = cleaned_path_coordinates[::-1] if is_spring_2021 else cleaned_path_coordinates
+
+            decision_points_list = decision_points(decision_path_coordinates)
+            clustered_decision_points_list = cluster_decision_points(decision_points_list, eps)
+
+            dp_to_remove = get_dp_to_remove(key)
+
+            clustered_decision_points_list = [
+                point for i, point in enumerate(clustered_decision_points_list, 1)
+                if i not in dp_to_remove
+            ]
+
+            decision_points_output_path = os.path.join(processed_directory, f"decpoints_{key}.txt")
+            save_coordinates_to_txt(clustered_decision_points_list, decision_points_output_path)
+
+            coordinates_output_path = os.path.join(processed_directory, f"coordinates_{key}.txt")
+            save_coordinates_to_txt(cleaned_path_coordinates, coordinates_output_path, is_spring_2021)
+
+            track_data = pd.read_csv(track_data_path)
+            track_data = replace_inf(track_data)
+
+            raw_shrew_coordinates = list(zip(track_data['x'], track_data['y']))  # Save before smoothing
+            track_data = smooth_data(track_data)
+
+            shrew_coordinates = list(zip(track_data['x'], track_data['y']))
+
+            overlay_image = masked_path_image.copy()
+            overlay_path(overlay_image, shrew_coordinates)
+
+            track_data = mark_path_status(track_data, cleaned_path_coordinates)
+
+            track_data_output_path = os.path.join(processed_directory, f"track_{key}.csv")
+            track_data.to_csv(track_data_output_path, index=False)
+
+            path_efficiency, path_buffer = calculate_adjusted_path_efficiency_with_buffer(
+                cleaned_path_coordinates, shrew_coordinates, track_data, buffer_width
+            )
+
+            reference_path = cleaned_path_coordinates[::-1] if is_spring_2021 else cleaned_path_coordinates
+            print("First 5 coordinates of reference path:")
+            for coord in reference_path[:5]:
+                print(coord)
+                
+            print("Last 5 coordinates of reference path:")
+            for coord in reference_path[-5:]:
+                print(coord)
+
+            cumulative_distances = calculate_cumulative_distances(reference_path)
+
+            projected_distances = project_points_onto_path(shrew_coordinates, reference_path, cumulative_distances)
+            
+            if is_spring_2021:
+                path_length = cumulative_distances[-1]
+                projected_distances = path_length - projected_distances
+            
+            directional_movement = determine_directional_movement(projected_distances, reversed_trial=is_spring_2021)
+
+
+            directional_path_efficiency = calculate_directional_efficiency(
+                track_data, path_buffer, directional_movement
+            )
+            print("First 10 projected distances:", projected_distances[:10])
+            print("First 10 directional movement labels:", directional_movement[:10])
+
+
+            print(f"Length check → track_data: {len(track_data)}, directional_movement: {len(directional_movement)}")
+
+            perc_backward, perc_backward_buffer = calculate_backward_metrics(
+                track_data, directional_movement, path_buffer
+            )
+
+            false_indices = track_data.index[track_data['on_path_smoothed'] == False]
+            total_deviation_sequences = 0
+            first_deviation_start = first_deviation_end = first_deviation_length = first_deviation_point = None
+
+            if len(false_indices) > 0:
+                deviation_sequences = []
+                current_sequence_start = false_indices[0]
+                current_sequence_end = false_indices[0]
+
+                for i in range(1, len(false_indices)):
+                    if false_indices[i] != false_indices[i - 1] + 1:
+                        deviation_sequences.append((current_sequence_start, current_sequence_end))
+                        current_sequence_start = false_indices[i]
+                    current_sequence_end = false_indices[i]
+
+                deviation_sequences.append((current_sequence_start, current_sequence_end))
+                total_deviation_sequences = len(deviation_sequences)
+                first_deviation_start, first_deviation_end = deviation_sequences[0]
+
+                first_deviation_length = calculate_path_length(
+                    track_data[['x', 'y']].iloc[first_deviation_start:first_deviation_end + 1].values.tolist()
+                )
+
+                if clustered_decision_points_list:
+                    _, first_deviation_point = find_closest_decision_point(
+                        track_data[['x', 'y']].iloc[first_deviation_start].values.tolist(),
+                        clustered_decision_points_list)
+
+            season, id_part, trial = key.split('_')
+            unique_trial_ID = f"{season}_{id_part}_{trial}"
+
+            results.append({
+                "unique_trial_ID": unique_trial_ID,
+                "ID": id_part,
+                "season": season,
+                "trial": trial,
+                "path_efficiency": path_efficiency,
+                "directional_path_efficiency": directional_path_efficiency,
+                "perc_backward": perc_backward,
+                "perc_backward_buffer": perc_backward_buffer,
+                "shrew_path_length": calculate_path_length(raw_shrew_coordinates),
+                "correct_path_length": calculate_path_length(cleaned_path_coordinates),
+                "total_deviation_sequences": total_deviation_sequences,
+                "first_deviation_point": first_deviation_point,
+                "first_deviation_length": first_deviation_length
+            })
+
+           # print(f"Finished processing group: {key}")
+        else:
+            print(f"Missing files for group: {key}")
+
+    df_results = pd.DataFrame(results)
+    df_results.to_csv(os.path.join(results_directory, 'maze_results.csv'), index=False)
+    #print("Finished process_data_sets function")
+```
+
+Run the functions.
+
+```{python}
+#| scrolled: true
+process_data_sets(file_groups, raw_directory, processed_directory, min_distance=1)
+```
+
+## Deviation from path
+
+The following functions calculate deviations from the correct path. A deviation sequence is defined as one or more consecutive frames where the 
+animal was outside the buffer zone around the correct path. Short gaps (≤ 3 frames) are smoothed over and treated as on-path to reduce noise.
+
+`calculate_deviation_report()` reads the processed track files output by `process_data_sets()` and must be run after that section. It computes the 
+total number and length of deviation sequences per trial, and associates each deviation with the nearest decision point.
+
+Results are appended to `maze_results.csv` and saved in full to `deviation_report.csv`.
+
+```{python}
+def load_coordinates_from_txt(file_path):
+    coordinates = []
+    with open(file_path, 'r') as f:
+        for line in f:
+            x, y = map(float, line.strip().split(','))
+            coordinates.append((x, y))
+    return coordinates
+```
+
+```{python}
+def calculate_deviation_report(file_dict, processed_directory, results_directory, min_distance=1.0, eps=2.0):
+    maze_results_path = os.path.join(results_directory, 'maze_results.csv')
+    maze_results = pd.read_csv(maze_results_path)
+
+    detailed_deviation_results = []
+    total_deviation_lengths = {}
+
+    for key, files in file_dict.items():
+        if files['path_png'] and files['mask_png'] and files['track_csv']:
+            print(f"Processing group: {key} for deviation report")
+            track_data_path = os.path.join(processed_directory, f"track_{key}.csv")
+
+            # Read the track data with 'on_path_smoothed'
+            track_data = pd.read_csv(track_data_path)
+            
+            # Check for deviations based on 'on_path_smoothed'
+            false_indices = track_data.index[track_data['on_path_smoothed'] == False]
+            total_deviation_sequences = 0
+            total_deviation_length = 0
+            deviations = []
+
+            if len(false_indices) > 0:
+                # Identify all consecutive FALSE sequences in 'on_path_smoothed'
+                deviation_sequences = []
+                start_idx = false_indices[0]
+                end_idx = start_idx
+
+                for i in range(1, len(false_indices)):
+                    if false_indices[i] != false_indices[i-1] + 1:
+                        # Found a break in the sequence
+                        deviation_sequences.append((start_idx, end_idx))
+                        start_idx = false_indices[i]
+                    end_idx = false_indices[i]
+                # Append the last sequence
+                deviation_sequences.append((start_idx, end_idx))
+
+                # Calculate the length of each deviation sequence
+                for start, end in deviation_sequences:
+                    deviation_path = track_data[['x', 'y']].iloc[start:end+1].values.tolist()
+                    deviation_length = calculate_path_length(deviation_path)  # Length in cm
+                    total_deviation_length += deviation_length
+                    deviations.append((deviation_path, deviation_length))
+                
+                # Update total_deviation_sequences
+                total_deviation_sequences = len(deviation_sequences)
+
+            print(f"Total Deviation Sequences for {key}: {total_deviation_sequences}")
+            print(f"Total Deviation Length for {key}: {total_deviation_length}")
+
+            decision_points_path = os.path.join(processed_directory, f"decpoints_{key}.txt")
+            clustered_decision_points_list = load_coordinates_from_txt(decision_points_path)  # Use existing function to load
+
+            first_deviation_point_num = None
+            first_deviation_length = None
+            first_deviation_frame = None  
+
+            # If deviations exist, associate the first deviation with a decision point
+            if deviations and clustered_decision_points_list:
+                _, first_deviation_point_num = find_closest_decision_point(deviations[0][0][0], clustered_decision_points_list)
+                first_deviation_length = deviations[0][1]
+                first_deviation_frame = track_data.loc[track_data[['x', 'y']].apply(tuple, axis=1).isin([tuple(deviations[0][0][0])]), 'frame'].values[0]
+
+            parts = key.split('_')
+            season = parts[0]
+            id_part = parts[1]
+            trial = parts[2]
+
+            unique_trial_ID = f"{season}_{id_part}_{trial}"
+
+            # save the results 
+            maze_results_row = maze_results.loc[maze_results['unique_trial_ID'] == unique_trial_ID]
+            if not maze_results_row.empty:
+                # Now we save the total_deviation_sequences instead of total deviations
+                maze_results.loc[maze_results['unique_trial_ID'] == unique_trial_ID, 'total_deviations'] = total_deviation_sequences
+                maze_results.loc[maze_results['unique_trial_ID'] == unique_trial_ID, 'total_deviation_length'] = total_deviation_length
+                maze_results.loc[maze_results['unique_trial_ID'] == unique_trial_ID, 'first_deviation_point'] = int(first_deviation_point_num) if first_deviation_point_num is not None else None
+                maze_results.loc[maze_results['unique_trial_ID'] == unique_trial_ID, 'first_deviation_length'] = first_deviation_length
+            else:
+                print(f"Warning: unique_trial_ID {unique_trial_ID} not found in maze_results")
+
+            for deviation in deviations:
+                deviation_path, deviation_length = deviation
+                deviation_start = deviation_path[0]
+                _, deviation_point_num = find_closest_decision_point(deviation_start, clustered_decision_points_list)
+                deviation_frame = track_data.loc[track_data[['x', 'y']].apply(tuple, axis=1).isin([tuple(deviation_start)]), 'frame'].values[0]
+                
+                detailed_deviation_results.append({
+                    "unique_trial_ID": unique_trial_ID,
+                    "ID": id_part,
+                    "season": season,
+                    "trial": trial,
+                    "deviation_start": deviation_start,
+                    "deviation_point": deviation_point_num,
+                    "deviation_length": deviation_length,
+                    "deviation_frame": deviation_frame
+                })
+
+    maze_results.to_csv(maze_results_path, index=False)
+    df_detailed_deviation_results = pd.DataFrame(detailed_deviation_results)
+    df_detailed_deviation_results.to_csv(os.path.join(results_directory, 'deviation_report.csv'), index=False)
+    print("Deviation report saved successfully.")
+```
+
+Run the functions.
+
+```{python}
+#| scrolled: true
+calculate_deviation_report(file_groups, processed_directory, results_directory)
+```
+
+## Visual check
+
+`plot_trial_check()` is an optional diagnostic function, not part of the main pipeline. It displays the correct path, buffer zone, decision points, and the animal's track for a single trial, coloured by on-path (blue) and off-path (red) status.
+
+Replace the key in the example call below with any valid trial ID to inspect a different trial.
+
+```{python}
+def plot_trial_check(key, processed_directory):
+    track_data = pd.read_csv(os.path.join(processed_directory, f"track_{key}.csv"))
+    correct_path = load_coordinates_from_txt(os.path.join(processed_directory, f"coordinates_{key}.txt"))
+    decision_pts = load_coordinates_from_txt(os.path.join(processed_directory, f"decpoints_{key}.txt"))
+
+    line = LineString(correct_path)
+    buffer = line.buffer(1)
+    bx, by = buffer.exterior.xy
+
+    on_path = track_data[track_data['on_path_smoothed'] == True]
+    off_path = track_data[track_data['on_path_smoothed'] == False]
+
+    plt.figure(figsize=(10, 10))
+    plt.fill(bx, by, color='lightgreen', alpha=0.4, label='Buffer zone')
+    plt.plot(*zip(*correct_path), color='green', linewidth=2, label='Correct path')
+    plt.scatter(on_path['x'], on_path['y'], color='blue', s=1, label='On path')
+    plt.scatter(off_path['x'], off_path['y'], color='red', s=1, label='Off path')
+    for i, (x, y) in enumerate(decision_pts):
+        plt.scatter(x, y, color='orange', s=40, zorder=5)
+        plt.text(x, y, str(i + 1), fontsize=9, color='black')
+    plt.title(f"Trial check: {key}")
+    plt.xlabel('X (cm)')
+    plt.ylabel('Y (cm)')
+    plt.legend()
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    plt.show()
+```
+
+
+```{python}
+plot_trial_check("spring_20240520-2_T1", processed_directory)
+```
