@@ -1,0 +1,13 @@
+# Data handling
+numpy==1.26.4
+pandas
+scipy
+
+# Image processing & Math
+opencv-python
+scikit-image
+shapely
+scikit-learn
+
+# Visualization
+matplotlib
