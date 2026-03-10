@@ -55,7 +55,6 @@ shrew-learning/
     ├── data/
     │   ├── raw/
     │   ├── processed/
-    │   └── results/
     └── scripts/
         ├── data_cleaning.R   
         └── models.R 
