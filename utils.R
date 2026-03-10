@@ -4,6 +4,8 @@ category_colors <- c("summer_wild" = "#D16103", "winter_captive" = "#0AA9A9",
 category_names <- c("summer_wild" = "Summer Wild", "winter_wild" = "Winter Wild",  
                     "spring_wild" = "Spring Wild", "winter_captive" = "Winter Captive",  
                     "spring_captive" = "Spring Captive")
+category_levels <- c("summer_wild", "winter_wild", "spring_wild",
+                     "winter_captive", "spring_captive")
 
 season_colors <- c("summer" = "#D16103", "winter" = "#0A33A9", "spring" = "#006400")
 season_names <- c("summer" = "Summer", "winter" = "Winter", "spring" = "Spring")
